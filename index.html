@@ -201,6 +201,113 @@
             opacity: 0.5;
             cursor: not-allowed;
         }
+
+        /* Stats Panel */
+        #statsPanel {
+            position: fixed;
+            top: 180px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.75);
+            border: 2px solid #ffd700;
+            border-radius: 8px;
+            padding: 10px 12px;
+            font-size: 11px;
+            z-index: 100;
+            display: none;
+        }
+        #statsPanel h4 {
+            color: #ffd700;
+            font-size: 12px;
+            margin-bottom: 8px;
+            text-align: center;
+            border-bottom: 1px solid #444;
+            padding-bottom: 5px;
+        }
+        .stat-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin: 4px 0;
+        }
+        .stat-icon {
+            width: 16px;
+            text-align: center;
+        }
+        .stat-label {
+            width: 35px;
+            color: #888;
+            font-size: 10px;
+        }
+        .stat-value {
+            color: #ffd700;
+            font-weight: bold;
+            min-width: 45px;
+            text-align: right;
+        }
+        .stat-value.buffed {
+            color: #44ff44;
+        }
+
+        /* Weapon Bar */
+        #weaponBar {
+            position: fixed;
+            bottom: 60px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: none;
+            gap: 8px;
+            z-index: 100;
+        }
+        .weapon-slot {
+            width: 48px;
+            height: 48px;
+            background: rgba(0, 0, 0, 0.8);
+            border: 2px solid #ffd700;
+            border-radius: 6px;
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .weapon-slot canvas {
+            width: 32px;
+            height: 32px;
+            image-rendering: pixelated;
+        }
+        .weapon-slot .weapon-name {
+            position: absolute;
+            bottom: -16px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 8px;
+            color: #aaa;
+            white-space: nowrap;
+        }
+        .weapon-slot .level-badge {
+            position: absolute;
+            top: -6px;
+            right: -6px;
+            background: #ffd700;
+            color: #000;
+            font-size: 10px;
+            font-weight: bold;
+            padding: 1px 5px;
+            border-radius: 8px;
+            min-width: 16px;
+            text-align: center;
+        }
+        .weapon-slot .cooldown-overlay {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: rgba(0, 0, 0, 0.6);
+            border-radius: 0 0 4px 4px;
+        }
+        .weapon-slot.firing {
+            border-color: #fff;
+            box-shadow: 0 0 10px rgba(255, 215, 0, 0.5);
+        }
     </style>
 </head>
 <body>
@@ -262,6 +369,44 @@
                 <div>Kills: <span id="killsText">0</span></div>
                 <div>Gold: <span id="goldText">0</span></div>
             </div>
+
+            <!-- Stats Panel -->
+            <div id="statsPanel">
+                <h4>STATS</h4>
+                <div class="stat-row">
+                    <span class="stat-icon">&#9876;</span>
+                    <span class="stat-label">DMG</span>
+                    <span id="statDamage" class="stat-value">100%</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-icon">&#9889;</span>
+                    <span class="stat-label">SPD</span>
+                    <span id="statSpeed" class="stat-value">100%</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-icon">&#128481;</span>
+                    <span class="stat-label">ATK</span>
+                    <span id="statAttackSpeed" class="stat-value">100%</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-icon">&#128737;</span>
+                    <span class="stat-label">ARM</span>
+                    <span id="statArmor" class="stat-value">0%</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-icon">&#127808;</span>
+                    <span class="stat-label">CRIT</span>
+                    <span id="statCrit" class="stat-value">0%</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-icon">&#128151;</span>
+                    <span class="stat-label">REGEN</span>
+                    <span id="statRegen" class="stat-value">0/s</span>
+                </div>
+            </div>
+
+            <!-- Weapon Bar -->
+            <div id="weaponBar"></div>
 
             <!-- Druid Form Buttons -->
             <div id="druidForms">

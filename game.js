@@ -20,6 +20,8 @@ let killCount = 0;
 let goldCollected = 0;
 let currentWave = 1;
 let spawnTimer = 0;
+let pendingLevelUps = 0; // Queue for level-ups
+let vacuumPickups = []; // Pickups being vacuumed to player
 let isPaused = false;
 
 // Meta Progression (saved to localStorage)
@@ -725,9 +727,23 @@ function initEnemyTypes() {
             size: 1.2,
             minWave: 7,
             ranged: true
+        },
+        reaper: {
+            name: 'REAPER',
+            hp: 99999,
+            damage: 99999,
+            speed: 0.15,
+            xp: 0,
+            color: new Color(0.1, 0.1, 0.1),
+            size: 2.5,
+            minWave: 999,
+            isBoss: true
         }
     };
 }
+
+// Track if reaper has been spawned
+let reaperSpawned = false;
 
 // ============================================
 // WEAPON DEFINITIONS
@@ -783,6 +799,47 @@ const WEAPONS = {
         projectiles: 2,
         homing: true,
         type: 'projectile'
+    },
+    // Passive weapons (always active)
+    holyOrbit: {
+        name: 'Holy Orbit',
+        damage: 0.5,
+        orbitRadius: 2.5,
+        orbitSpeed: 3.5,
+        projectiles: 3,
+        type: 'orbit'
+    },
+    garlicAura: {
+        name: 'Garlic Aura',
+        damage: 0.3,
+        radius: 2,
+        tickRate: 0.5,
+        knockback: 0.15,
+        type: 'aura'
+    },
+    boomerang: {
+        name: 'Boomerang',
+        damage: 0.8,
+        cooldown: 1.5,
+        range: 6,
+        projectiles: 1,
+        type: 'boomerang'
+    },
+    lightning: {
+        name: 'Lightning',
+        damage: 1.2,
+        cooldown: 1.8,
+        range: 10,
+        strikes: 1,
+        type: 'lightning'
+    },
+    throwingAxe: {
+        name: 'Throwing Axe',
+        damage: 1.5,
+        cooldown: 2.0,
+        projectiles: 1,
+        penetration: 3,
+        type: 'axe'
     }
 };
 
@@ -798,7 +855,13 @@ const UPGRADES = [
     { id: 'pickupRange', name: 'Magnet', desc: '+50% Pickup Range', stat: 'pickupRange', value: 0.5 },
     { id: 'regen', name: 'Regeneration', desc: '+1 HP/sec', stat: 'regen', value: 1 },
     { id: 'armor', name: 'Armor', desc: '-10% Damage Taken', stat: 'armor', value: 0.1 },
-    { id: 'luck', name: 'Luck', desc: '+10% Crit Chance', stat: 'critChance', value: 0.1 }
+    { id: 'luck', name: 'Luck', desc: '+10% Crit Chance', stat: 'critChance', value: 0.1 },
+    // Passive weapons - level up increases damage, frequency, and projectiles
+    { id: 'holyOrbit', name: 'Holy Orbit', desc: 'Orbiting orbs. Lvl+: +orb, +dmg', stat: 'passiveWeapon', value: 'holyOrbit', isWeapon: true },
+    { id: 'garlicAura', name: 'Garlic Aura', desc: 'Damage aura. Lvl+: +area, +dmg', stat: 'passiveWeapon', value: 'garlicAura', isWeapon: true },
+    { id: 'boomerang', name: 'Boomerang', desc: 'Returning blade. Lvl+: +speed, +dmg', stat: 'passiveWeapon', value: 'boomerang', isWeapon: true },
+    { id: 'lightning', name: 'Lightning', desc: 'Random bolts. Lvl+: +strikes, +dmg', stat: 'passiveWeapon', value: 'lightning', isWeapon: true },
+    { id: 'throwingAxe', name: 'Throwing Axe', desc: 'High dmg, penetrates. Lvl+: +axes', stat: 'passiveWeapon', value: 'throwingAxe', isWeapon: true }
 ];
 
 // ============================================
@@ -841,6 +904,15 @@ class Player extends EngineObject {
         this.weaponTimer = 0;
         this.weaponLevels = {};
         this.weaponLevels[this.currentWeapon] = 1;
+
+        // Passive weapons (orbit, aura, etc.)
+        this.passiveWeapons = {};
+        this.orbitingProjectiles = [];
+        this.auraEffect = null;
+        this.auraDamageTimer = 0;
+        this.boomerangTimer = 0;
+        this.lightningTimer = 0;
+        this.axeTimer = 0;
 
         // Druid specific
         this.currentForm = 'human';
@@ -904,9 +976,11 @@ class Player extends EngineObject {
             this.animFrame = (this.animFrame + 1) % 4;
         }
 
-        // Clamp to world bounds
-        this.pos.x = clamp(this.pos.x, 1, WORLD_SIZE.x - 1);
-        this.pos.y = clamp(this.pos.y, 1, WORLD_SIZE.y - 1);
+        // Clamp to world bounds - horizontal is infinite, vertical is limited
+        // Player can move left/right freely but has top/bottom limits
+        const verticalLimit = 25; // How far up/down player can go from center
+        const centerY = WORLD_SIZE.y / 2;
+        this.pos.y = clamp(this.pos.y, centerY - verticalLimit, centerY + verticalLimit);
 
         // Update camera
         cameraPos = this.pos;
@@ -976,6 +1050,140 @@ class Player extends EngineObject {
             }
             if (dist < 0.5) {
                 pickup.collect();
+            }
+        }
+
+        // Update passive weapons
+        this.updatePassiveWeapons();
+    }
+
+    updatePassiveWeapons() {
+        // Update orbiting projectiles
+        if (this.passiveWeapons.holyOrbit) {
+            const weapon = WEAPONS.holyOrbit;
+            const level = this.passiveWeapons.holyOrbit;
+            const projectileCount = weapon.projectiles + Math.floor((level - 1) / 2);
+            const radius = weapon.orbitRadius * (1 + (level - 1) * 0.1);
+            const damage = this.baseDamage * weapon.damage * this.damageMult * (1 + (level - 1) * 0.2);
+
+            // Create orbiting projectiles if needed
+            while (this.orbitingProjectiles.length < projectileCount) {
+                const orb = new OrbitingProjectile(this, this.orbitingProjectiles.length, projectileCount, radius, damage);
+                this.orbitingProjectiles.push(orb);
+            }
+
+            // Update existing orbitals with new stats
+            for (let i = 0; i < this.orbitingProjectiles.length; i++) {
+                const orb = this.orbitingProjectiles[i];
+                orb.updateStats(i, projectileCount, radius, damage);
+            }
+        }
+
+        // Update aura damage
+        if (this.passiveWeapons.garlicAura) {
+            const weapon = WEAPONS.garlicAura;
+            const level = this.passiveWeapons.garlicAura;
+            const radius = weapon.radius * (1 + (level - 1) * 0.15);
+            const damage = this.baseDamage * weapon.damage * this.damageMult * (1 + (level - 1) * 0.2);
+            const knockback = weapon.knockback * (1 + (level - 1) * 0.1);
+
+            this.auraDamageTimer -= timeDelta;
+            if (this.auraDamageTimer <= 0) {
+                this.auraDamageTimer = weapon.tickRate;
+
+                // Damage all enemies in radius
+                for (let enemy of enemies) {
+                    const dist = this.pos.distance(enemy.pos);
+                    if (dist < radius) {
+                        enemy.takeDamage(damage);
+                        // Apply knockback
+                        const knockbackDir = enemy.pos.subtract(this.pos).normalize();
+                        enemy.pos = enemy.pos.add(knockbackDir.scale(knockback));
+                    }
+                }
+            }
+        }
+
+        // Update boomerang
+        if (this.passiveWeapons.boomerang) {
+            const weapon = WEAPONS.boomerang;
+            const level = this.passiveWeapons.boomerang;
+            const cooldown = weapon.cooldown / (1 + (level - 1) * 0.1);
+            const damage = this.baseDamage * weapon.damage * this.damageMult * (1 + (level - 1) * 0.2);
+            const range = weapon.range * (1 + (level - 1) * 0.1);
+            const projectileCount = weapon.projectiles + Math.floor((level - 1) / 3);
+
+            this.boomerangTimer -= timeDelta;
+            if (this.boomerangTimer <= 0) {
+                this.boomerangTimer = cooldown;
+
+                // Find nearest enemy to aim at
+                let targetDir = vec2(this.facingLeft ? -1 : 1, 0);
+                if (enemies.length > 0) {
+                    let nearest = null;
+                    let nearestDist = Infinity;
+                    for (let enemy of enemies) {
+                        const dist = this.pos.distance(enemy.pos);
+                        if (dist < nearestDist && dist < range * 2) {
+                            nearestDist = dist;
+                            nearest = enemy;
+                        }
+                    }
+                    if (nearest) {
+                        targetDir = nearest.pos.subtract(this.pos).normalize();
+                    }
+                }
+
+                // Throw boomerang(s)
+                for (let i = 0; i < projectileCount; i++) {
+                    let dir = targetDir;
+                    if (projectileCount > 1) {
+                        const angleOffset = (i - (projectileCount - 1) / 2) * 0.4;
+                        dir = targetDir.rotate(angleOffset);
+                    }
+                    new BoomerangProjectile(this.pos.add(dir.scale(0.3)), dir, damage, range, this);
+                }
+            }
+        }
+
+        // Update lightning
+        if (this.passiveWeapons.lightning) {
+            const weapon = WEAPONS.lightning;
+            const level = this.passiveWeapons.lightning;
+            const cooldown = weapon.cooldown / (1 + (level - 1) * 0.15);
+            const damage = this.baseDamage * weapon.damage * this.damageMult * (1 + (level - 1) * 0.25);
+            const range = weapon.range * (1 + (level - 1) * 0.1);
+            const strikes = weapon.strikes + Math.floor((level - 1) / 2);
+
+            this.lightningTimer -= timeDelta;
+            if (this.lightningTimer <= 0 && enemies.length > 0) {
+                this.lightningTimer = cooldown;
+
+                // Strike multiple enemies
+                for (let i = 0; i < strikes; i++) {
+                    new LightningStrike(this, damage, range);
+                }
+            }
+        }
+
+        // Update throwing axe
+        if (this.passiveWeapons.throwingAxe) {
+            const weapon = WEAPONS.throwingAxe;
+            const level = this.passiveWeapons.throwingAxe;
+            const cooldown = weapon.cooldown / (1 + (level - 1) * 0.12);
+            const damage = this.baseDamage * weapon.damage * this.damageMult * (1 + (level - 1) * 0.2);
+            const penetration = weapon.penetration + Math.floor((level - 1) / 2);
+            const projectileCount = weapon.projectiles + Math.floor((level - 1) / 3);
+
+            this.axeTimer -= timeDelta;
+            if (this.axeTimer <= 0 && enemies.length > 0) {
+                this.axeTimer = cooldown;
+
+                // Throw axes in spread pattern
+                for (let i = 0; i < projectileCount; i++) {
+                    const spreadAngle = (i - (projectileCount - 1) / 2) * 0.5;
+                    new AxeProjectile(this.pos, damage, penetration, spreadAngle);
+                }
             }
         }
     }
@@ -1129,6 +1337,12 @@ class Player extends EngineObject {
             this.xp -= this.xpToLevel;
             this.level++;
             this.xpToLevel = Math.floor(this.xpToLevel * 1.5);
+            // Queue the level-up instead of showing immediately
+            pendingLevelUps++;
+        }
+
+        // Show level-up if not already showing and there are pending levels
+        if (gameState === 'playing' && pendingLevelUps > 0) {
             showLevelUp();
         }
 
@@ -1161,6 +1375,14 @@ class Player extends EngineObject {
                 break;
             case 'critChance':
                 this.critChance = Math.min(0.8, this.critChance + upgrade.value);
+                break;
+            case 'passiveWeapon':
+                // Add or level up passive weapon
+                if (this.passiveWeapons[upgrade.value]) {
+                    this.passiveWeapons[upgrade.value]++;
+                } else {
+                    this.passiveWeapons[upgrade.value] = 1;
+                }
                 break;
         }
         updateHUD();
@@ -1200,6 +1422,53 @@ class Player extends EngineObject {
     }
 
     render() {
+        // Draw aura effect if active
+        if (this.passiveWeapons.garlicAura) {
+            const weapon = WEAPONS.garlicAura;
+            const level = this.passiveWeapons.garlicAura;
+            const radius = weapon.radius * (1 + (level - 1) * 0.15);
+
+            // Multiple pulsing rings
+            const pulse1 = 0.7 + Math.sin(time * 3) * 0.3;
+            const pulse2 = 0.7 + Math.sin(time * 3 + Math.PI) * 0.3;
+
+            // Inner glow
+            drawRect(this.pos, vec2(radius * 1.2, radius * 1.2), new Color(0.3, 0.9, 0.3, 0.08));
+
+            // Animated ring particles
+            const particleCount = 8 + level * 2;
+            for (let i = 0; i < particleCount; i++) {
+                const angle = (i / particleCount) * Math.PI * 2 + time * 0.5;
+                const particleRadius = radius * (0.85 + Math.sin(time * 4 + i) * 0.1);
+                const particlePos = this.pos.add(vec2(Math.cos(angle) * particleRadius, Math.sin(angle) * particleRadius));
+                const particleSize = 0.12 + Math.sin(time * 6 + i * 0.5) * 0.04;
+                drawRect(particlePos, vec2(particleSize, particleSize), new Color(0.5, 1, 0.4, 0.7));
+            }
+
+            // Outer ring
+            const segments = 32;
+            for (let i = 0; i < segments; i++) {
+                const angle1 = (i / segments) * Math.PI * 2;
+                const angle2 = ((i + 1) / segments) * Math.PI * 2;
+                const waveOffset = Math.sin(angle1 * 4 + time * 3) * 0.1;
+                const r1 = radius * (1 + waveOffset);
+                const r2 = radius * (1 + Math.sin(angle2 * 4 + time * 3) * 0.1);
+                const p1 = this.pos.add(vec2(Math.cos(angle1) * r1, Math.sin(angle1) * r1));
+                const p2 = this.pos.add(vec2(Math.cos(angle2) * r2, Math.sin(angle2) * r2));
+                const segmentAlpha = 0.4 + Math.sin(angle1 * 2 + time * 2) * 0.2;
+                drawLine(p1, p2, 0.1, new Color(0.4, 1, 0.4, segmentAlpha * pulse1));
+            }
+
+            // Inner subtle ring
+            for (let i = 0; i < segments; i++) {
+                const angle1 = (i / segments) * Math.PI * 2;
+                const angle2 = ((i + 1) / segments) * Math.PI * 2;
+                const p1 = this.pos.add(vec2(Math.cos(angle1) * radius * 0.6, Math.sin(angle1) * radius * 0.6));
+                const p2 = this.pos.add(vec2(Math.cos(angle2) * radius * 0.6, Math.sin(angle2) * radius * 0.6));
+                drawLine(p1, p2, 0.05, new Color(0.6, 1, 0.5, 0.2 * pulse2));
+            }
+        }
+
         // Get sprite index based on class and form
         let spriteIndex;
         if (this.classType === 'warrior') {
@@ -1236,15 +1505,34 @@ class Enemy extends EngineObject {
 
         this.type = type;
         this.data = data;
-        this.hp = data.hp * (1 + (currentWave - 1) * 0.1);
-        this.maxHp = this.hp;
-        this.damage = data.damage * (1 + (currentWave - 1) * 0.05);
-        this.speed = data.speed;
-        this.xpValue = data.xp;
+
+        // Time-based scaling (exponential growth)
+        const minutes = gameTime / 60;
+        const timeScale = 1 + (minutes * 0.15) + Math.pow(minutes / 10, 2);
+        const waveScale = 1 + (currentWave - 1) * 0.1;
+
+        // Combined scaling
+        const totalScale = timeScale * waveScale;
+
+        // Boss enemies don't scale
+        if (data.isBoss) {
+            this.hp = data.hp;
+            this.maxHp = this.hp;
+            this.damage = data.damage;
+            this.speed = data.speed;
+        } else {
+            this.hp = data.hp * totalScale;
+            this.maxHp = this.hp;
+            this.damage = data.damage * (1 + minutes * 0.08 + (currentWave - 1) * 0.05);
+            this.speed = data.speed * (1 + minutes * 0.01); // Slight speed increase over time
+        }
+
+        this.xpValue = Math.ceil(data.xp * (1 + minutes * 0.05));
 
         this.color = data.color;
         this.damageTimer = 0;
         this.rangedTimer = 0;
+        this.isBoss = data.isBoss || false;
 
         // Animation
         this.animFrame = 0;
@@ -1305,11 +1593,16 @@ class Enemy extends EngineObject {
         }
     }
 
-    takeDamage(amount) {
+    takeDamage(amount, isCrit = false) {
         this.hp -= amount;
 
         // Flash white
         this.flashTimer = 0.1;
+
+        // Spawn floating damage number
+        const numType = isCrit ? 'crit' : 'damage';
+        const offsetPos = this.pos.add(vec2((Math.random() - 0.5) * 0.3, 0.3));
+        new DamageNumber(offsetPos, amount, numType);
 
         if (this.hp <= 0) {
             this.die();
@@ -1317,17 +1610,31 @@ class Enemy extends EngineObject {
     }
 
     die() {
+        // Spawn death effect
+        const enemyColor = this.data.color || new Color(1, 0.3, 0.3);
+        new DeathEffect(this.pos, enemyColor, this.data.size, this.type);
+
         // Drop XP
         new XPOrb(this.pos, this.xpValue);
 
-        // Chance to drop gold
+        // Chance to drop gold (30%)
         if (Math.random() < 0.3) {
             new GoldPickup(this.pos, Math.ceil(this.xpValue * 2));
         }
 
-        // Chance to drop health
+        // Chance to drop health (10%)
         if (Math.random() < 0.1) {
             new HealthPickup(this.pos);
+        }
+
+        // Rare drops - Treasure Chest (1.5% - free upgrade)
+        if (Math.random() < 0.015) {
+            new TreasureChest(this.pos.add(vec2((Math.random() - 0.5) * 0.5, (Math.random() - 0.5) * 0.5)));
+        }
+
+        // Rare drops - Vacuum Crystal (0.8% - collect all pickups)
+        if (Math.random() < 0.008) {
+            new VacuumCrystal(this.pos.add(vec2((Math.random() - 0.5) * 0.5, (Math.random() - 0.5) * 0.5)));
         }
 
         // Remove from enemies array
@@ -1341,6 +1648,12 @@ class Enemy extends EngineObject {
     }
 
     render() {
+        // Special rendering for Reaper boss
+        if (this.isBoss) {
+            this.renderReaper();
+            return;
+        }
+
         // Get sprite index for this enemy type
         const spriteIndex = SPRITE_INDEX[this.type];
 
@@ -1367,6 +1680,54 @@ class Enemy extends EngineObject {
             );
         }
     }
+
+    renderReaper() {
+        const pulse = 1 + Math.sin(time * 4) * 0.1;
+        const size = this.data.size * pulse;
+
+        // Dark aura
+        drawRect(this.pos, vec2(size * 2, size * 2), new Color(0, 0, 0, 0.3));
+        drawRect(this.pos, vec2(size * 1.5, size * 1.5), new Color(0.1, 0, 0.1, 0.4));
+
+        // Main body (dark hooded figure)
+        drawRect(this.pos, vec2(size, size * 1.3), new Color(0.05, 0.05, 0.1, 1));
+
+        // Hood
+        drawRect(this.pos.add(vec2(0, size * 0.4)), vec2(size * 0.9, size * 0.6), new Color(0.02, 0.02, 0.05, 1));
+
+        // Red eyes
+        const eyeGlow = 0.7 + Math.sin(time * 8) * 0.3;
+        drawRect(this.pos.add(vec2(-size * 0.15, size * 0.35)), vec2(0.15, 0.1), new Color(1, 0, 0, eyeGlow));
+        drawRect(this.pos.add(vec2(size * 0.15, size * 0.35)), vec2(0.15, 0.1), new Color(1, 0, 0, eyeGlow));
+
+        // Scythe
+        const scytheAngle = Math.sin(time * 3) * 0.2;
+        const scytheDir = vec2(Math.cos(scytheAngle - 0.5), Math.sin(scytheAngle - 0.5));
+        const scytheStart = this.pos.add(vec2(size * 0.5, 0));
+        const scytheEnd = scytheStart.add(scytheDir.scale(size * 1.2));
+        drawLine(scytheStart, scytheEnd, 0.1, new Color(0.3, 0.3, 0.35, 1));
+
+        // Scythe blade
+        const bladePos = scytheEnd;
+        const perpDir = vec2(-scytheDir.y, scytheDir.x);
+        drawLine(bladePos, bladePos.add(perpDir.scale(size * 0.6)), 0.15, new Color(0.5, 0.5, 0.55, 1));
+
+        // Floating particles
+        for (let i = 0; i < 6; i++) {
+            const particleAngle = time * 2 + (i / 6) * Math.PI * 2;
+            const particleRadius = size * 0.8 + Math.sin(time * 3 + i) * 0.2;
+            const particlePos = this.pos.add(vec2(
+                Math.cos(particleAngle) * particleRadius,
+                Math.sin(particleAngle) * particleRadius - size * 0.3
+            ));
+            const particleAlpha = 0.3 + Math.sin(time * 5 + i) * 0.2;
+            drawRect(particlePos, vec2(0.1, 0.1), new Color(0.3, 0, 0.3, particleAlpha));
+        }
+
+        // Name tag
+        const namePos = this.pos.add(vec2(0, size + 0.5));
+        drawRect(namePos, vec2(2, 0.4), new Color(0.5, 0, 0, 0.8));
+    }
 }
 
 // ============================================
@@ -1382,14 +1743,25 @@ class Projectile extends EngineObject {
         this.homing = homing;
         this.speed = 0.2;
         this.distanceTraveled = 0;
-        this.color = color;
+        this.projectileColor = color;
         this.renderOrder = 5;
+        this.trailPositions = [];
+        this.rotation = Math.random() * Math.PI * 2;
     }
 
     update() {
         super.update();
 
         if (gameState !== 'playing') return;
+
+        // Store trail positions
+        this.trailPositions.unshift(this.pos.copy());
+        if (this.trailPositions.length > 5) {
+            this.trailPositions.pop();
+        }
+
+        // Spin effect
+        this.rotation += 0.2;
 
         // Homing behavior - only after traveling some distance, with gentle correction
         if (this.homing && enemies.length > 0 && this.distanceTraveled > 2) {
@@ -1404,7 +1776,6 @@ class Projectile extends EngineObject {
             }
             if (nearest && nearestDist < 6) {
                 const toTarget = nearest.pos.subtract(this.pos).normalize();
-                // Gentler homing - only 3% correction per frame instead of 10%
                 this.dir = this.dir.lerp(toTarget, 0.03).normalize();
             }
         }
@@ -1416,6 +1787,10 @@ class Projectile extends EngineObject {
         for (let enemy of enemies) {
             if (this.pos.distance(enemy.pos) < 0.5) {
                 enemy.takeDamage(this.damage);
+                // Spawn hit particles
+                for (let i = 0; i < 3; i++) {
+                    new HitParticle(this.pos, this.projectileColor);
+                }
                 this.remove();
                 return;
             }
@@ -1424,6 +1799,34 @@ class Projectile extends EngineObject {
         // Remove if traveled too far
         if (this.distanceTraveled > this.range) {
             this.remove();
+        }
+    }
+
+    render() {
+        const c = this.projectileColor;
+
+        // Draw trail
+        for (let i = 0; i < this.trailPositions.length; i++) {
+            const alpha = (1 - i / this.trailPositions.length) * 0.5;
+            const trailSize = 0.2 * (1 - i / this.trailPositions.length);
+            drawRect(this.trailPositions[i], vec2(trailSize, trailSize), new Color(c.r, c.g, c.b, alpha));
+        }
+
+        // Outer glow
+        const pulse = 1 + Math.sin(time * 10) * 0.1;
+        drawRect(this.pos, vec2(0.4 * pulse, 0.4 * pulse), new Color(c.r, c.g, c.b, 0.3));
+
+        // Main projectile body
+        drawRect(this.pos, vec2(0.25, 0.25), new Color(c.r, c.g, c.b, 1));
+
+        // Bright core
+        drawRect(this.pos, vec2(0.12, 0.12), new Color(1, 1, 1, 0.9));
+
+        // Sparkle for homing projectiles
+        if (this.homing) {
+            const sparkleAngle = time * 8;
+            const sparkleOffset = vec2(Math.cos(sparkleAngle) * 0.15, Math.sin(sparkleAngle) * 0.15);
+            drawRect(this.pos.add(sparkleOffset), vec2(0.08, 0.08), new Color(1, 1, 1, 0.7));
         }
     }
 
@@ -1441,14 +1844,24 @@ class EnemyProjectile extends EngineObject {
         this.damage = damage;
         this.speed = 0.1;
         this.distanceTraveled = 0;
-        this.color = new Color(1, 0.2, 0.2);
+        this.projectileColor = new Color(1, 0.2, 0.2);
         this.renderOrder = 5;
+        this.trailPositions = [];
+        this.rotation = 0;
     }
 
     update() {
         super.update();
 
         if (gameState !== 'playing' || !player) return;
+
+        // Store trail
+        this.trailPositions.unshift(this.pos.copy());
+        if (this.trailPositions.length > 4) {
+            this.trailPositions.pop();
+        }
+
+        this.rotation += 0.15;
 
         this.pos = this.pos.add(this.dir.scale(this.speed));
         this.distanceTraveled += this.speed;
@@ -1466,10 +1879,720 @@ class EnemyProjectile extends EngineObject {
         }
     }
 
+    render() {
+        // Draw trail
+        for (let i = 0; i < this.trailPositions.length; i++) {
+            const alpha = (1 - i / this.trailPositions.length) * 0.4;
+            const trailSize = 0.15 * (1 - i / this.trailPositions.length);
+            drawRect(this.trailPositions[i], vec2(trailSize, trailSize), new Color(1, 0.3, 0.1, alpha));
+        }
+
+        // Outer glow
+        const pulse = 1 + Math.sin(time * 12) * 0.15;
+        drawRect(this.pos, vec2(0.35 * pulse, 0.35 * pulse), new Color(1, 0.2, 0, 0.3));
+
+        // Main body
+        drawRect(this.pos, vec2(0.2, 0.2), new Color(1, 0.3, 0.1, 1));
+
+        // Hot core
+        drawRect(this.pos, vec2(0.1, 0.1), new Color(1, 0.8, 0.2, 1));
+    }
+
     remove() {
         const index = projectiles.indexOf(this);
         if (index > -1) projectiles.splice(index, 1);
         this.destroy();
+    }
+}
+
+// ============================================
+// ORBITING PROJECTILE CLASS
+// ============================================
+
+class OrbitingProjectile extends EngineObject {
+    constructor(owner, index, total, radius, damage) {
+        super(owner.pos, vec2(0.5, 0.5));
+        this.owner = owner;
+        this.orbitIndex = index;
+        this.totalOrbitals = total;
+        this.orbitRadius = radius;
+        this.damage = damage;
+        this.orbitAngle = (index / total) * Math.PI * 2;
+        this.orbitSpeed = WEAPONS.holyOrbit.orbitSpeed;
+        this.damageCooldowns = new Map();
+        this.renderOrder = 15;
+        this.trailPositions = []; // Trail effect
+        this.hitFlash = 0;
+    }
+
+    updateStats(index, total, radius, damage) {
+        this.orbitIndex = index;
+        this.totalOrbitals = total;
+        this.orbitRadius = radius;
+        this.damage = damage;
+    }
+
+    update() {
+        super.update();
+
+        if (gameState !== 'playing' || !this.owner) return;
+
+        // Store previous position for trail
+        this.trailPositions.unshift(this.pos.copy());
+        if (this.trailPositions.length > 8) {
+            this.trailPositions.pop();
+        }
+
+        // Rotate around player - using global time for consistent speed
+        this.orbitAngle += this.orbitSpeed * timeDelta;
+
+        // Calculate new position
+        const offsetX = Math.cos(this.orbitAngle) * this.orbitRadius;
+        const offsetY = Math.sin(this.orbitAngle) * this.orbitRadius;
+        this.pos = this.owner.pos.add(vec2(offsetX, offsetY));
+
+        // Update hit flash
+        if (this.hitFlash > 0) this.hitFlash -= timeDelta;
+
+        // Update damage cooldowns
+        for (let [enemyId, cooldown] of this.damageCooldowns) {
+            const newCooldown = cooldown - timeDelta;
+            if (newCooldown <= 0) {
+                this.damageCooldowns.delete(enemyId);
+            } else {
+                this.damageCooldowns.set(enemyId, newCooldown);
+            }
+        }
+
+        // Check enemy collisions
+        for (let enemy of enemies) {
+            if (this.pos.distance(enemy.pos) < 0.7) {
+                const enemyId = enemies.indexOf(enemy);
+                if (!this.damageCooldowns.has(enemyId)) {
+                    enemy.takeDamage(this.damage);
+                    this.damageCooldowns.set(enemyId, 0.25);
+                    this.hitFlash = 0.15;
+                    // Spawn hit particles
+                    new HitParticle(this.pos, new Color(1, 0.9, 0.4));
+                }
+            }
+        }
+    }
+
+    render() {
+        // Draw trail
+        for (let i = 0; i < this.trailPositions.length; i++) {
+            const alpha = (1 - i / this.trailPositions.length) * 0.4;
+            const trailSize = 0.3 * (1 - i / this.trailPositions.length);
+            drawRect(this.trailPositions[i], vec2(trailSize, trailSize), new Color(1, 0.8, 0.2, alpha));
+        }
+
+        // Pulsing effect
+        const pulse = 1 + Math.sin(time * 8 + this.orbitIndex * 2) * 0.15;
+        const baseSize = 0.45 * pulse;
+
+        // Outer glow (larger, more transparent)
+        drawRect(this.pos, vec2(baseSize * 2.2, baseSize * 2.2), new Color(1, 0.7, 0.1, 0.15));
+        drawRect(this.pos, vec2(baseSize * 1.6, baseSize * 1.6), new Color(1, 0.8, 0.2, 0.3));
+
+        // Main orb with gradient effect
+        const mainColor = this.hitFlash > 0 ? new Color(1, 1, 1, 1) : new Color(1, 0.9, 0.3, 1);
+        drawRect(this.pos, vec2(baseSize, baseSize), mainColor);
+
+        // Inner bright core
+        drawRect(this.pos, vec2(baseSize * 0.5, baseSize * 0.5), new Color(1, 1, 0.8, 1));
+
+        // Sparkle effect
+        const sparkleAngle = time * 10 + this.orbitIndex;
+        const sparkleOffset = vec2(Math.cos(sparkleAngle) * baseSize * 0.3, Math.sin(sparkleAngle) * baseSize * 0.3);
+        drawRect(this.pos.add(sparkleOffset), vec2(0.1, 0.1), new Color(1, 1, 1, 0.8));
+    }
+
+    remove() {
+        const index = this.owner.orbitingProjectiles.indexOf(this);
+        if (index > -1) this.owner.orbitingProjectiles.splice(index, 1);
+        this.destroy();
+    }
+}
+
+// ============================================
+// BOOMERANG PROJECTILE CLASS
+// ============================================
+
+class BoomerangProjectile extends EngineObject {
+    constructor(pos, dir, damage, range, owner) {
+        super(pos, vec2(0.5, 0.5));
+        this.startPos = pos.copy();
+        this.dir = dir;
+        this.damage = damage;
+        this.range = range;
+        this.owner = owner;
+        this.speed = 0.18;
+        this.distanceTraveled = 0;
+        this.returning = false;
+        this.rotation = 0;
+        this.hitEnemies = new Set(); // Track hit enemies to avoid double hits
+        this.renderOrder = 10;
+        this.trailPositions = [];
+        projectiles.push(this);
+    }
+
+    update() {
+        super.update();
+
+        if (gameState !== 'playing') return;
+
+        // Store trail positions
+        this.trailPositions.unshift(this.pos.copy());
+        if (this.trailPositions.length > 6) {
+            this.trailPositions.pop();
+        }
+
+        // Spin the boomerang
+        this.rotation += 0.4;
+
+        if (!this.returning) {
+            // Moving outward
+            this.pos = this.pos.add(this.dir.scale(this.speed));
+            this.distanceTraveled += this.speed;
+
+            if (this.distanceTraveled >= this.range) {
+                this.returning = true;
+                this.hitEnemies.clear(); // Can hit enemies again on return
+            }
+        } else {
+            // Returning to player
+            if (player) {
+                const toPlayer = player.pos.subtract(this.pos);
+                const dist = toPlayer.length();
+
+                if (dist < 0.5) {
+                    this.remove();
+                    return;
+                }
+
+                this.dir = toPlayer.normalize();
+                this.pos = this.pos.add(this.dir.scale(this.speed * 1.2));
+            } else {
+                this.remove();
+                return;
+            }
+        }
+
+        // Check enemy collisions
+        for (let enemy of enemies) {
+            if (!this.hitEnemies.has(enemy) && this.pos.distance(enemy.pos) < 0.7) {
+                enemy.takeDamage(this.damage);
+                this.hitEnemies.add(enemy);
+                new HitParticle(this.pos, new Color(0.6, 0.4, 0.2));
+            }
+        }
+    }
+
+    render() {
+        // Draw trail
+        for (let i = 0; i < this.trailPositions.length; i++) {
+            const alpha = (1 - i / this.trailPositions.length) * 0.5;
+            const trailSize = 0.25 * (1 - i / this.trailPositions.length);
+            drawRect(this.trailPositions[i], vec2(trailSize, trailSize), new Color(0.8, 0.6, 0.3, alpha));
+        }
+
+        // Spinning boomerang shape (cross pattern)
+        const cos = Math.cos(this.rotation);
+        const sin = Math.sin(this.rotation);
+
+        // Main body
+        const armLength = 0.35;
+        const armWidth = 0.12;
+
+        // Draw as rotating cross shape
+        for (let arm = 0; arm < 4; arm++) {
+            const armAngle = this.rotation + (arm * Math.PI / 2);
+            const armDir = vec2(Math.cos(armAngle), Math.sin(armAngle));
+            const armEnd = this.pos.add(armDir.scale(armLength));
+
+            // Arm gradient
+            const baseColor = new Color(0.7, 0.5, 0.2, 1);
+            const tipColor = new Color(0.9, 0.7, 0.3, 1);
+
+            drawLine(this.pos, armEnd, armWidth, baseColor);
+            drawRect(armEnd, vec2(0.1, 0.1), tipColor);
+        }
+
+        // Center
+        drawRect(this.pos, vec2(0.15, 0.15), new Color(0.9, 0.8, 0.5, 1));
+
+        // Motion blur glow when spinning fast
+        drawRect(this.pos, vec2(0.5, 0.5), new Color(0.8, 0.6, 0.3, 0.2));
+    }
+
+    remove() {
+        const index = projectiles.indexOf(this);
+        if (index > -1) projectiles.splice(index, 1);
+        this.destroy();
+    }
+}
+
+// ============================================
+// LIGHTNING STRIKE CLASS
+// ============================================
+
+class LightningStrike extends EngineObject {
+    constructor(owner, damage, range) {
+        super(owner.pos, vec2(1, 1));
+        this.owner = owner;
+        this.damage = damage;
+        this.range = range;
+        this.renderOrder = 25;
+
+        // Find random enemy in range
+        const enemiesInRange = enemies.filter(e => owner.pos.distance(e.pos) < range);
+        if (enemiesInRange.length > 0) {
+            this.target = enemiesInRange[Math.floor(Math.random() * enemiesInRange.length)];
+            this.strikePos = this.target.pos.copy();
+            this.target.takeDamage(damage);
+
+            // Chain lightning effect
+            this.segments = this.generateLightningPath(owner.pos, this.strikePos);
+            this.lifetime = 0.25;
+            this.maxLifetime = 0.25;
+
+            // Spawn particles at strike point
+            for (let i = 0; i < 5; i++) {
+                new HitParticle(this.strikePos, new Color(0.5, 0.7, 1));
+            }
+        } else {
+            this.lifetime = 0;
+            this.destroy();
+        }
+    }
+
+    generateLightningPath(start, end) {
+        const segments = [];
+        const numPoints = 8;
+        const dir = end.subtract(start);
+        const perpendicular = vec2(-dir.y, dir.x).normalize();
+
+        let prevPoint = start;
+        for (let i = 1; i <= numPoints; i++) {
+            const t = i / numPoints;
+            const basePoint = start.add(dir.scale(t));
+
+            // Add jagged offset (less at start and end)
+            const jitterAmount = Math.sin(t * Math.PI) * 0.8;
+            const jitter = (Math.random() - 0.5) * jitterAmount;
+            const point = basePoint.add(perpendicular.scale(jitter));
+
+            segments.push({ start: prevPoint, end: point });
+            prevPoint = point;
+        }
+        return segments;
+    }
+
+    update() {
+        super.update();
+        this.lifetime -= timeDelta;
+        if (this.lifetime <= 0) {
+            this.destroy();
+        }
+    }
+
+    render() {
+        if (!this.segments) return;
+
+        const alpha = this.lifetime / this.maxLifetime;
+        const flash = Math.sin(time * 50) > 0 ? 1 : 0.7;
+
+        // Draw each segment with glow
+        for (let seg of this.segments) {
+            // Outer glow
+            drawLine(seg.start, seg.end, 0.25, new Color(0.3, 0.5, 1, alpha * 0.3));
+            // Main bolt
+            drawLine(seg.start, seg.end, 0.12, new Color(0.6, 0.8, 1, alpha * flash));
+            // Core
+            drawLine(seg.start, seg.end, 0.05, new Color(1, 1, 1, alpha));
+        }
+
+        // Strike point flash
+        if (this.strikePos) {
+            const flashSize = 0.8 * alpha;
+            drawRect(this.strikePos, vec2(flashSize * 2, flashSize * 2), new Color(0.5, 0.7, 1, alpha * 0.3));
+            drawRect(this.strikePos, vec2(flashSize, flashSize), new Color(0.8, 0.9, 1, alpha * 0.6));
+        }
+    }
+}
+
+// ============================================
+// AXE PROJECTILE CLASS
+// ============================================
+
+class AxeProjectile extends EngineObject {
+    constructor(pos, damage, penetration, spreadAngle) {
+        super(pos, vec2(0.6, 0.6));
+        this.damage = damage;
+        this.penetration = penetration;
+        this.hitCount = 0;
+
+        // Axe throws upward then falls down
+        this.velocityX = Math.sin(spreadAngle) * 0.08;
+        this.velocityY = 0.25; // Initial upward velocity
+        this.gravity = 0.008;
+
+        this.rotation = 0;
+        this.rotationSpeed = 0.35;
+        this.trailPositions = [];
+        this.hitEnemies = new Set();
+        this.renderOrder = 12;
+        this.lifetime = 4; // Max lifetime
+
+        projectiles.push(this);
+    }
+
+    update() {
+        super.update();
+
+        if (gameState !== 'playing') return;
+
+        // Store trail
+        this.trailPositions.unshift(this.pos.copy());
+        if (this.trailPositions.length > 8) {
+            this.trailPositions.pop();
+        }
+
+        // Apply gravity - axe goes up then falls
+        this.velocityY -= this.gravity;
+
+        // Move axe
+        this.pos.x += this.velocityX;
+        this.pos.y += this.velocityY;
+
+        // Spin faster as it falls
+        const fallSpeed = Math.abs(this.velocityY);
+        this.rotation += this.rotationSpeed + fallSpeed * 0.5;
+
+        // Lifetime
+        this.lifetime -= timeDelta;
+        if (this.lifetime <= 0) {
+            this.remove();
+            return;
+        }
+
+        // Check enemy collisions - can penetrate multiple enemies
+        for (let enemy of enemies) {
+            if (!this.hitEnemies.has(enemy) && this.pos.distance(enemy.pos) < 0.8) {
+                enemy.takeDamage(this.damage);
+                this.hitEnemies.add(enemy);
+                this.hitCount++;
+
+                // Spawn hit particles
+                for (let i = 0; i < 4; i++) {
+                    new HitParticle(this.pos, new Color(0.6, 0.6, 0.6));
+                }
+
+                // Remove if exceeded penetration
+                if (this.hitCount >= this.penetration) {
+                    this.remove();
+                    return;
+                }
+            }
+        }
+
+        // Remove if way off screen (below player)
+        if (player && this.pos.y < player.pos.y - 20) {
+            this.remove();
+        }
+    }
+
+    render() {
+        // Draw trail
+        for (let i = 0; i < this.trailPositions.length; i++) {
+            const alpha = (1 - i / this.trailPositions.length) * 0.4;
+            const trailSize = 0.3 * (1 - i / this.trailPositions.length);
+            drawRect(this.trailPositions[i], vec2(trailSize, trailSize), new Color(0.5, 0.5, 0.5, alpha));
+        }
+
+        // Axe head (spinning)
+        const axeSize = 0.5;
+
+        // Draw axe shape - blade and handle
+        for (let blade = 0; blade < 2; blade++) {
+            const bladeAngle = this.rotation + blade * Math.PI;
+            const bladeDir = vec2(Math.cos(bladeAngle), Math.sin(bladeAngle));
+
+            // Blade
+            const bladeEnd = this.pos.add(bladeDir.scale(axeSize));
+            const bladeColor = new Color(0.7, 0.7, 0.75, 1);
+            drawLine(this.pos, bladeEnd, 0.2, bladeColor);
+
+            // Blade edge (sharper tip)
+            const perpDir = vec2(-bladeDir.y, bladeDir.x);
+            const edgePos = bladeEnd.add(perpDir.scale(0.15));
+            drawLine(bladeEnd, edgePos, 0.1, new Color(0.85, 0.85, 0.9, 1));
+        }
+
+        // Handle
+        const handleAngle = this.rotation + Math.PI / 2;
+        const handleDir = vec2(Math.cos(handleAngle), Math.sin(handleAngle));
+        const handleEnd = this.pos.add(handleDir.scale(axeSize * 0.6));
+        drawLine(this.pos, handleEnd, 0.12, new Color(0.5, 0.35, 0.2, 1));
+
+        // Center
+        drawRect(this.pos, vec2(0.15, 0.15), new Color(0.4, 0.4, 0.45, 1));
+
+        // Motion blur glow
+        if (Math.abs(this.velocityY) > 0.1) {
+            drawRect(this.pos, vec2(0.7, 0.7), new Color(0.6, 0.6, 0.7, 0.15));
+        }
+    }
+
+    remove() {
+        const index = projectiles.indexOf(this);
+        if (index > -1) projectiles.splice(index, 1);
+        this.destroy();
+    }
+}
+
+// ============================================
+// FLOATING DAMAGE NUMBER CLASS
+// ============================================
+
+class DamageNumber extends EngineObject {
+    constructor(pos, damage, type = 'damage') {
+        super(pos, vec2(0.5, 0.5));
+        this.damageValue = Math.round(damage);
+        this.type = type; // 'damage', 'crit', 'heal', 'playerDamage'
+        this.lifetime = 0.9;
+        this.maxLifetime = 0.9;
+        this.velocity = vec2((Math.random() - 0.5) * 0.08, 0.12);
+        this.renderOrder = 100;
+
+        // Visual settings per type
+        this.settings = {
+            damage: { color: new Color(1, 1, 1), scale: 1, prefix: '' },
+            crit: { color: new Color(1, 0.9, 0.2), scale: 1.5, prefix: '' },
+            heal: { color: new Color(0.3, 1, 0.4), scale: 1, prefix: '+' },
+            playerDamage: { color: new Color(1, 0.3, 0.3), scale: 1.2, prefix: '-' }
+        };
+    }
+
+    update() {
+        super.update();
+        this.pos = this.pos.add(this.velocity);
+        this.velocity.y *= 0.96;
+        this.velocity.x *= 0.98;
+        this.lifetime -= timeDelta;
+        if (this.lifetime <= 0) {
+            this.destroy();
+        }
+    }
+
+    render() {
+        const progress = this.lifetime / this.maxLifetime;
+        const alpha = progress;
+        const setting = this.settings[this.type];
+        const scale = setting.scale * (0.8 + progress * 0.4);
+
+        // Pop-in effect at start
+        const popScale = this.lifetime > this.maxLifetime - 0.1 ?
+            1 + (this.maxLifetime - this.lifetime) * 3 : 1;
+
+        const finalScale = scale * popScale;
+        const text = setting.prefix + this.damageValue.toString();
+
+        // Draw each digit
+        const digitWidth = 0.25 * finalScale;
+        const startX = this.pos.x - (text.length * digitWidth) / 2;
+
+        for (let i = 0; i < text.length; i++) {
+            const char = text[i];
+            const digitPos = vec2(startX + i * digitWidth + digitWidth / 2, this.pos.y);
+
+            // Outer glow for crits
+            if (this.type === 'crit') {
+                drawRect(digitPos, vec2(0.35 * finalScale, 0.45 * finalScale),
+                    new Color(1, 0.7, 0, alpha * 0.3));
+            }
+
+            // Draw digit
+            this.drawDigit(char, digitPos, finalScale, setting.color, alpha);
+        }
+    }
+
+    drawDigit(char, pos, scale, color, alpha) {
+        const s = 0.08 * scale;
+        const c = new Color(color.r, color.g, color.b, alpha);
+
+        // Simple block-based digit patterns
+        const patterns = {
+            '0': [[0,2],[1,2],[2,2],[0,1],[2,1],[0,0],[2,0],[0,-1],[2,-1],[0,-2],[1,-2],[2,-2]],
+            '1': [[1,2],[1,1],[1,0],[1,-1],[1,-2]],
+            '2': [[0,2],[1,2],[2,2],[2,1],[0,0],[1,0],[2,0],[0,-1],[0,-2],[1,-2],[2,-2]],
+            '3': [[0,2],[1,2],[2,2],[2,1],[1,0],[2,0],[2,-1],[0,-2],[1,-2],[2,-2]],
+            '4': [[0,2],[2,2],[0,1],[2,1],[0,0],[1,0],[2,0],[2,-1],[2,-2]],
+            '5': [[0,2],[1,2],[2,2],[0,1],[0,0],[1,0],[2,0],[2,-1],[0,-2],[1,-2],[2,-2]],
+            '6': [[0,2],[1,2],[2,2],[0,1],[0,0],[1,0],[2,0],[0,-1],[2,-1],[0,-2],[1,-2],[2,-2]],
+            '7': [[0,2],[1,2],[2,2],[2,1],[2,0],[2,-1],[2,-2]],
+            '8': [[0,2],[1,2],[2,2],[0,1],[2,1],[0,0],[1,0],[2,0],[0,-1],[2,-1],[0,-2],[1,-2],[2,-2]],
+            '9': [[0,2],[1,2],[2,2],[0,1],[2,1],[0,0],[1,0],[2,0],[2,-1],[0,-2],[1,-2],[2,-2]],
+            '+': [[1,1],[0,0],[1,0],[2,0],[1,-1]],
+            '-': [[0,0],[1,0],[2,0]]
+        };
+
+        const pattern = patterns[char];
+        if (pattern) {
+            for (let p of pattern) {
+                drawRect(pos.add(vec2(p[0] * s - s, p[1] * s)), vec2(s * 0.9, s * 0.9), c);
+            }
+        }
+    }
+}
+
+// ============================================
+// DEATH EFFECT CLASS
+// ============================================
+
+class DeathEffect extends EngineObject {
+    constructor(pos, color, size, enemyType) {
+        super(pos, vec2(size, size));
+        this.particles = [];
+        this.effectColor = color;
+        this.enemyType = enemyType;
+
+        // Different effects per enemy type
+        const particleCount = this.getParticleCount(enemyType, size);
+        const colors = this.getColors(enemyType, color);
+
+        // Create burst of particles
+        for (let i = 0; i < particleCount; i++) {
+            const angle = (i / particleCount) * Math.PI * 2 + Math.random() * 0.3;
+            const speed = 0.08 + Math.random() * 0.12;
+            const colorIndex = Math.floor(Math.random() * colors.length);
+
+            this.particles.push({
+                pos: pos.copy(),
+                vel: vec2(Math.cos(angle) * speed, Math.sin(angle) * speed),
+                size: 0.12 + Math.random() * 0.15,
+                maxLife: 0.5 + Math.random() * 0.4,
+                life: 0.5 + Math.random() * 0.4,
+                color: colors[colorIndex],
+                rotation: Math.random() * Math.PI * 2,
+                rotSpeed: (Math.random() - 0.5) * 0.3
+            });
+        }
+
+        // Add center flash
+        this.flashLife = 0.15;
+        this.lifetime = 1.2;
+        this.renderOrder = 18;
+    }
+
+    getParticleCount(type, size) {
+        const counts = {
+            imp: 10,
+            skeleton: 14,
+            zombie: 12,
+            demonKnight: 18,
+            lich: 16
+        };
+        return (counts[type] || 12) + Math.floor(size * 3);
+    }
+
+    getColors(type, baseColor) {
+        const colorSets = {
+            imp: [new Color(1, 0.4, 0.1), new Color(1, 0.6, 0.2), new Color(1, 0.2, 0)],
+            skeleton: [new Color(0.9, 0.9, 0.85), new Color(0.7, 0.7, 0.65), new Color(1, 1, 0.95)],
+            zombie: [new Color(0.3, 0.7, 0.3), new Color(0.4, 0.5, 0.2), new Color(0.2, 0.6, 0.2)],
+            demonKnight: [new Color(0.6, 0.1, 0.1), new Color(0.4, 0.1, 0.2), new Color(0.8, 0.2, 0.1)],
+            lich: [new Color(0.6, 0.3, 0.8), new Color(0.4, 0.2, 0.6), new Color(0.8, 0.5, 1)]
+        };
+        return colorSets[type] || [baseColor, baseColor.lerp ? baseColor.lerp(new Color(1,1,1), 0.3) : baseColor];
+    }
+
+    update() {
+        super.update();
+
+        // Update flash
+        if (this.flashLife > 0) {
+            this.flashLife -= timeDelta;
+        }
+
+        // Update particles
+        for (let p of this.particles) {
+            p.pos = p.pos.add(p.vel);
+            p.vel = p.vel.scale(0.94);
+            p.vel.y -= 0.002; // Slight gravity
+            p.life -= timeDelta;
+            p.rotation += p.rotSpeed;
+        }
+
+        this.particles = this.particles.filter(p => p.life > 0);
+        this.lifetime -= timeDelta;
+
+        if (this.lifetime <= 0 || this.particles.length === 0) {
+            this.destroy();
+        }
+    }
+
+    render() {
+        // Initial flash
+        if (this.flashLife > 0) {
+            const flashAlpha = this.flashLife / 0.15;
+            const flashSize = 1.5 * (1 - flashAlpha) + 0.5;
+            drawRect(this.pos, vec2(flashSize, flashSize), new Color(1, 1, 1, flashAlpha * 0.6));
+        }
+
+        // Draw particles
+        for (let p of this.particles) {
+            const alpha = p.life / p.maxLife;
+            const size = p.size * (0.5 + alpha * 0.5);
+            const c = p.color;
+
+            // Outer glow
+            drawRect(p.pos, vec2(size * 1.5, size * 1.5), new Color(c.r, c.g, c.b, alpha * 0.2));
+
+            // Main particle
+            drawRect(p.pos, vec2(size, size), new Color(c.r, c.g, c.b, alpha));
+
+            // Inner bright spot
+            if (alpha > 0.5) {
+                drawRect(p.pos, vec2(size * 0.4, size * 0.4), new Color(1, 1, 1, (alpha - 0.5) * 0.8));
+            }
+        }
+    }
+}
+
+// ============================================
+// HIT PARTICLE CLASS
+// ============================================
+
+class HitParticle extends EngineObject {
+    constructor(pos, color) {
+        super(pos, vec2(0.15, 0.15));
+        this.particleColor = color;
+        this.velocity = vec2(
+            (Math.random() - 0.5) * 0.15,
+            (Math.random() - 0.5) * 0.15 + 0.05
+        );
+        this.lifetime = 0.3 + Math.random() * 0.2;
+        this.maxLifetime = this.lifetime;
+        this.renderOrder = 20;
+    }
+
+    update() {
+        super.update();
+        this.pos = this.pos.add(this.velocity);
+        this.velocity = this.velocity.scale(0.95);
+        this.lifetime -= timeDelta;
+        if (this.lifetime <= 0) {
+            this.destroy();
+        }
+    }
+
+    render() {
+        const alpha = this.lifetime / this.maxLifetime;
+        const size = 0.15 * alpha;
+        const c = this.particleColor;
+        drawRect(this.pos, vec2(size, size), new Color(c.r, c.g, c.b, alpha));
     }
 }
 
@@ -1482,6 +2605,7 @@ class XPOrb extends EngineObject {
         super(pos, vec2(0.3, 0.3));
         this.value = value;
         this.color = new Color(0.2, 1, 0.2);
+        this.bobOffset = Math.random() * Math.PI * 2;
         pickups.push(this);
     }
 
@@ -1491,6 +2615,27 @@ class XPOrb extends EngineObject {
         if (index > -1) pickups.splice(index, 1);
         this.destroy();
     }
+
+    render() {
+        const bob = Math.sin(time * 5 + this.bobOffset) * 0.05;
+        const drawPos = this.pos.add(vec2(0, bob));
+
+        // Size based on value
+        const baseSize = 0.2 + Math.min(this.value / 10, 0.15);
+        const pulse = 1 + Math.sin(time * 6 + this.bobOffset) * 0.15;
+        const size = baseSize * pulse;
+
+        // Outer glow
+        drawRect(drawPos, vec2(size * 2.5, size * 2.5), new Color(0.2, 1, 0.3, 0.1));
+        drawRect(drawPos, vec2(size * 1.8, size * 1.8), new Color(0.3, 1, 0.4, 0.2));
+
+        // Main orb
+        drawRect(drawPos, vec2(size, size), new Color(0.3, 0.95, 0.4, 1));
+
+        // Inner bright core
+        drawRect(drawPos, vec2(size * 0.5, size * 0.5), new Color(0.7, 1, 0.8, 1));
+        drawRect(drawPos, vec2(size * 0.25, size * 0.25), new Color(1, 1, 1, 0.9));
+    }
 }
 
 class GoldPickup extends EngineObject {
@@ -1498,6 +2643,8 @@ class GoldPickup extends EngineObject {
         super(pos, vec2(0.35, 0.35));
         this.value = value;
         this.color = new Color(1, 0.85, 0);
+        this.bobOffset = Math.random() * Math.PI * 2;
+        this.rotation = Math.random() * Math.PI * 2;
         pickups.push(this);
     }
 
@@ -1509,6 +2656,33 @@ class GoldPickup extends EngineObject {
         const index = pickups.indexOf(this);
         if (index > -1) pickups.splice(index, 1);
         this.destroy();
+    }
+
+    render() {
+        const bob = Math.sin(time * 4 + this.bobOffset) * 0.06;
+        this.rotation += timeDelta * 0.8;
+        const drawPos = this.pos.add(vec2(0, bob));
+
+        // Size based on value
+        const baseSize = 0.25 + Math.min(this.value / 20, 0.15);
+        const pulse = 1 + Math.sin(time * 5 + this.bobOffset) * 0.1;
+        const size = baseSize * pulse;
+
+        // Outer glow
+        drawRect(drawPos, vec2(size * 2.2, size * 2.2), new Color(1, 0.8, 0, 0.12));
+        drawRect(drawPos, vec2(size * 1.6, size * 1.6), new Color(1, 0.85, 0.1, 0.25));
+
+        // Coin shape (rotating)
+        const coinWidth = size * (0.6 + Math.abs(Math.cos(this.rotation)) * 0.4);
+        drawRect(drawPos, vec2(coinWidth, size), new Color(1, 0.8, 0.1, 1));
+
+        // Coin shine
+        const shineOffset = Math.cos(this.rotation) * size * 0.2;
+        drawRect(drawPos.add(vec2(shineOffset, 0)), vec2(size * 0.15, size * 0.6), new Color(1, 0.95, 0.5, 0.8));
+
+        // Sparkle
+        const sparkleAlpha = 0.5 + Math.sin(time * 8 + this.bobOffset) * 0.5;
+        drawRect(drawPos.add(vec2(0, size * 0.3)), vec2(0.08, 0.08), new Color(1, 1, 0.8, sparkleAlpha));
     }
 }
 
@@ -1526,6 +2700,183 @@ class HealthPickup extends EngineObject {
         if (index > -1) pickups.splice(index, 1);
         this.destroy();
     }
+
+    render() {
+        // Heart shape
+        const pulse = 1 + Math.sin(time * 4) * 0.1;
+        const size = 0.35 * pulse;
+
+        // Glow
+        drawRect(this.pos, vec2(size * 2, size * 2), new Color(1, 0.3, 0.3, 0.2));
+
+        // Heart body
+        drawRect(this.pos, vec2(size, size), new Color(1, 0.2, 0.2, 1));
+        drawRect(this.pos.add(vec2(0, size * 0.2)), vec2(size * 0.6, size * 0.6), new Color(1, 0.4, 0.4, 1));
+    }
+}
+
+// ============================================
+// TREASURE CHEST (3% drop - free upgrade)
+// ============================================
+
+class TreasureChest extends EngineObject {
+    constructor(pos) {
+        super(pos, vec2(0.6, 0.6));
+        this.bobOffset = Math.random() * Math.PI * 2;
+        this.sparkleTimer = 0;
+        this.renderOrder = 8;
+        pickups.push(this);
+    }
+
+    collect() {
+        // Give player a free upgrade
+        showLevelUp();
+
+        // Spawn celebration particles
+        for (let i = 0; i < 12; i++) {
+            const angle = (i / 12) * Math.PI * 2;
+            const particleColor = new Color(1, 0.85, 0.2);
+            new HitParticle(this.pos.add(vec2(Math.cos(angle) * 0.3, Math.sin(angle) * 0.3)), particleColor);
+        }
+
+        const index = pickups.indexOf(this);
+        if (index > -1) pickups.splice(index, 1);
+        this.destroy();
+    }
+
+    render() {
+        // Floating bob effect
+        const bob = Math.sin(time * 3 + this.bobOffset) * 0.1;
+        const drawPos = this.pos.add(vec2(0, bob));
+
+        // Outer crystal glow (bright and pulsing)
+        const glowPulse = 0.7 + Math.sin(time * 4) * 0.3;
+        drawRect(drawPos, vec2(1.4 * glowPulse, 1.4 * glowPulse), new Color(1, 0.85, 0.1, 0.15));
+        drawRect(drawPos, vec2(1.0 * glowPulse, 1.0 * glowPulse), new Color(1, 0.9, 0.3, 0.25));
+
+        // Chest body (golden)
+        drawRect(drawPos, vec2(0.55, 0.4), new Color(0.7, 0.5, 0.1, 1));
+        drawRect(drawPos.add(vec2(0, 0.05)), vec2(0.5, 0.35), new Color(0.85, 0.65, 0.15, 1));
+
+        // Chest lid
+        drawRect(drawPos.add(vec2(0, 0.22)), vec2(0.55, 0.15), new Color(0.75, 0.55, 0.1, 1));
+
+        // Chest lock/gem
+        drawRect(drawPos.add(vec2(0, 0.05)), vec2(0.12, 0.12), new Color(1, 0.9, 0.4, 1));
+        drawRect(drawPos.add(vec2(0, 0.05)), vec2(0.06, 0.06), new Color(1, 1, 0.8, 1));
+
+        // Sparkle effects
+        const sparkleCount = 4;
+        for (let i = 0; i < sparkleCount; i++) {
+            const sparkleAngle = time * 2 + (i / sparkleCount) * Math.PI * 2;
+            const sparkleRadius = 0.4 + Math.sin(time * 5 + i) * 0.1;
+            const sparklePos = drawPos.add(vec2(
+                Math.cos(sparkleAngle) * sparkleRadius,
+                Math.sin(sparkleAngle) * sparkleRadius + bob
+            ));
+            const sparkleAlpha = 0.5 + Math.sin(time * 8 + i * 2) * 0.5;
+            drawRect(sparklePos, vec2(0.08, 0.08), new Color(1, 1, 0.8, sparkleAlpha));
+        }
+
+        // Light rays
+        for (let i = 0; i < 4; i++) {
+            const rayAngle = time * 0.5 + (i / 4) * Math.PI * 2;
+            const rayEnd = drawPos.add(vec2(Math.cos(rayAngle) * 0.6, Math.sin(rayAngle) * 0.6));
+            drawLine(drawPos, rayEnd, 0.03, new Color(1, 0.95, 0.5, 0.3 * glowPulse));
+        }
+    }
+}
+
+// ============================================
+// VACUUM CRYSTAL (2% drop - sucks all pickups)
+// ============================================
+
+class VacuumCrystal extends EngineObject {
+    constructor(pos) {
+        super(pos, vec2(0.5, 0.5));
+        this.bobOffset = Math.random() * Math.PI * 2;
+        this.rotation = 0;
+        this.renderOrder = 8;
+        pickups.push(this);
+    }
+
+    collect() {
+        // Start vacuum animation - pickups flow toward player
+        for (let pickup of pickups) {
+            if (pickup !== this && pickup.pos) {
+                // Add to vacuum animation list
+                vacuumPickups.push({
+                    pickup: pickup,
+                    startPos: pickup.pos.copy(),
+                    progress: 0,
+                    delay: Math.random() * 0.3 // Stagger the animations
+                });
+            }
+        }
+
+        // Big particle burst
+        for (let i = 0; i < 20; i++) {
+            const angle = (i / 20) * Math.PI * 2;
+            const dist = 0.5 + Math.random() * 0.3;
+            const particleColor = new Color(0.5, 0.8, 1);
+            new HitParticle(this.pos.add(vec2(Math.cos(angle) * dist, Math.sin(angle) * dist)), particleColor);
+        }
+
+        const index = pickups.indexOf(this);
+        if (index > -1) pickups.splice(index, 1);
+        this.destroy();
+    }
+
+    render() {
+        // Floating and rotating
+        const bob = Math.sin(time * 2.5 + this.bobOffset) * 0.15;
+        this.rotation += timeDelta * 1.5;
+        const drawPos = this.pos.add(vec2(0, bob));
+
+        // Outer vacuum glow (cyan/blue)
+        const glowPulse = 0.6 + Math.sin(time * 5) * 0.4;
+        drawRect(drawPos, vec2(1.6 * glowPulse, 1.6 * glowPulse), new Color(0.3, 0.7, 1, 0.1));
+        drawRect(drawPos, vec2(1.2 * glowPulse, 1.2 * glowPulse), new Color(0.4, 0.8, 1, 0.2));
+
+        // Crystal shape (diamond)
+        const crystalSize = 0.35;
+        const points = 4;
+        for (let i = 0; i < points; i++) {
+            const angle1 = this.rotation + (i / points) * Math.PI * 2;
+            const angle2 = this.rotation + ((i + 1) / points) * Math.PI * 2;
+            const p1 = drawPos.add(vec2(Math.cos(angle1) * crystalSize, Math.sin(angle1) * crystalSize));
+            const p2 = drawPos.add(vec2(Math.cos(angle2) * crystalSize, Math.sin(angle2) * crystalSize));
+
+            // Crystal facets
+            drawLine(drawPos, p1, 0.15, new Color(0.5, 0.85, 1, 0.9));
+            drawLine(p1, p2, 0.1, new Color(0.7, 0.95, 1, 1));
+        }
+
+        // Inner bright core
+        drawRect(drawPos, vec2(0.2, 0.2), new Color(0.8, 0.95, 1, 1));
+        drawRect(drawPos, vec2(0.1, 0.1), new Color(1, 1, 1, 1));
+
+        // Suction swirl particles
+        const swirlCount = 6;
+        for (let i = 0; i < swirlCount; i++) {
+            const swirlAngle = time * 3 + (i / swirlCount) * Math.PI * 2;
+            const swirlRadius = 0.5 + Math.sin(time * 4 + i) * 0.15;
+            const swirlPos = drawPos.add(vec2(
+                Math.cos(swirlAngle) * swirlRadius,
+                Math.sin(swirlAngle) * swirlRadius
+            ));
+            const swirlAlpha = 0.4 + Math.sin(time * 6 + i * 1.5) * 0.4;
+            drawRect(swirlPos, vec2(0.06, 0.06), new Color(0.6, 0.9, 1, swirlAlpha));
+        }
+
+        // Inward arrows/lines (showing suction)
+        for (let i = 0; i < 4; i++) {
+            const arrowAngle = time * -1 + (i / 4) * Math.PI * 2;
+            const arrowStart = drawPos.add(vec2(Math.cos(arrowAngle) * 0.7, Math.sin(arrowAngle) * 0.7));
+            const arrowEnd = drawPos.add(vec2(Math.cos(arrowAngle) * 0.35, Math.sin(arrowAngle) * 0.35));
+            drawLine(arrowStart, arrowEnd, 0.04, new Color(0.5, 0.8, 1, 0.4 * glowPulse));
+        }
+    }
 }
 
 // ============================================
@@ -1539,7 +2890,8 @@ class MeleeEffect extends EngineObject {
         this.range = range;
         this.arc = arc;
         this.effectColor = color;
-        this.lifetime = 0.15;
+        this.lifetime = 0.2;
+        this.maxLifetime = 0.2;
         this.renderOrder = 15;
     }
 
@@ -1552,19 +2904,53 @@ class MeleeEffect extends EngineObject {
     }
 
     render() {
-        const alpha = this.lifetime / 0.15;
+        const progress = 1 - (this.lifetime / this.maxLifetime);
+        const alpha = (1 - progress) * 0.8;
         const c = this.effectColor;
 
-        // Draw arc using rotate() to handle LittleJS angle convention correctly
-        const segments = 8;
+        // Expanding arc effect
+        const currentRange = this.range * (0.3 + progress * 0.7);
+        const segments = 12;
         const halfArc = this.arc / 2;
+
+        // Draw filled arc segments
         for (let i = 0; i < segments; i++) {
             const angleOffset1 = -halfArc + (this.arc * i / segments);
             const angleOffset2 = -halfArc + (this.arc * (i + 1) / segments);
-            const p1 = this.pos.add(this.dir.rotate(angleOffset1).scale(this.range));
-            const p2 = this.pos.add(this.dir.rotate(angleOffset2).scale(this.range));
-            drawLine(this.pos, p1, 0.1, new Color(c.r, c.g, c.b, alpha));
-            drawLine(p1, p2, 0.1, new Color(c.r, c.g, c.b, alpha));
+
+            const innerRange = currentRange * 0.3;
+            const p1Inner = this.pos.add(this.dir.rotate(angleOffset1).scale(innerRange));
+            const p2Inner = this.pos.add(this.dir.rotate(angleOffset2).scale(innerRange));
+            const p1Outer = this.pos.add(this.dir.rotate(angleOffset1).scale(currentRange));
+            const p2Outer = this.pos.add(this.dir.rotate(angleOffset2).scale(currentRange));
+
+            // Gradient from inner to outer
+            const innerAlpha = alpha * 0.6;
+            const outerAlpha = alpha * 0.2;
+
+            // Draw segment lines
+            drawLine(p1Inner, p1Outer, 0.08, new Color(c.r, c.g, c.b, alpha * 0.5));
+            drawLine(p1Outer, p2Outer, 0.12, new Color(c.r, c.g, c.b, alpha));
+        }
+
+        // Outer glow edge
+        for (let i = 0; i < segments; i++) {
+            const angleOffset1 = -halfArc + (this.arc * i / segments);
+            const angleOffset2 = -halfArc + (this.arc * (i + 1) / segments);
+            const p1 = this.pos.add(this.dir.rotate(angleOffset1).scale(currentRange));
+            const p2 = this.pos.add(this.dir.rotate(angleOffset2).scale(currentRange));
+            drawLine(p1, p2, 0.2, new Color(1, 1, 1, alpha * 0.3));
+        }
+
+        // Impact sparkles
+        if (progress < 0.5) {
+            const sparkleCount = 4;
+            for (let i = 0; i < sparkleCount; i++) {
+                const sparkleAngle = -halfArc + (this.arc * (i + 0.5) / sparkleCount);
+                const sparklePos = this.pos.add(this.dir.rotate(sparkleAngle).scale(currentRange * 0.8));
+                const sparkleSize = 0.1 * (1 - progress * 2);
+                drawRect(sparklePos, vec2(sparkleSize, sparkleSize), new Color(1, 1, 1, alpha));
+            }
         }
     }
 }
@@ -1599,18 +2985,38 @@ class LightningEffect extends EngineObject {
 function spawnEnemies() {
     spawnTimer -= timeDelta;
 
+    // Spawn REAPER at 15 minutes (900 seconds)
+    if (gameTime >= 900 && !reaperSpawned) {
+        reaperSpawned = true;
+
+        // Spawn reaper from a random direction
+        const angle = Math.random() * Math.PI * 2;
+        const distance = 20;
+        const spawnPos = player.pos.add(vec2(
+            Math.cos(angle) * distance,
+            Math.sin(angle) * distance
+        ));
+
+        const reaper = new Enemy(spawnPos, 'reaper');
+        enemies.push(reaper);
+
+        // Show warning message (flash screen)
+        showReaperWarning();
+    }
+
     if (spawnTimer <= 0) {
-        // Determine spawn rate based on wave
-        const baseSpawnTime = Math.max(0.5, 2 - currentWave * 0.1);
+        // Determine spawn rate based on wave and time
+        const minutes = gameTime / 60;
+        const baseSpawnTime = Math.max(0.3, 2 - currentWave * 0.1 - minutes * 0.05);
         spawnTimer = baseSpawnTime;
 
-        // Get available enemy types for current wave
+        // Get available enemy types for current wave (exclude reaper)
         const availableTypes = Object.entries(ENEMY_TYPES)
-            .filter(([_, data]) => data.minWave <= currentWave)
+            .filter(([type, data]) => data.minWave <= currentWave && !data.isBoss)
             .map(([type, _]) => type);
 
-        // Spawn 1-3 enemies
-        const spawnCount = Math.min(3, 1 + Math.floor(currentWave / 3));
+        // Spawn count increases over time
+        const spawnCount = Math.min(5, 1 + Math.floor(currentWave / 3) + Math.floor(minutes / 5));
 
         for (let i = 0; i < spawnCount; i++) {
             // Random type weighted toward weaker enemies
@@ -1638,6 +3044,13 @@ function spawnEnemies() {
     }
 }
 
+// Reaper warning effect
+let reaperWarningTime = 0;
+
+function showReaperWarning() {
+    reaperWarningTime = 3; // 3 second warning
+}
+
 // ============================================
 // UI FUNCTIONS
 // ============================================
@@ -1648,6 +3061,8 @@ function showMainMenu() {
     document.getElementById('classSelect').style.display = 'none';
     document.getElementById('upgradeShop').style.display = 'none';
     document.getElementById('hud').style.display = 'none';
+    document.getElementById('statsPanel').style.display = 'none';
+    document.getElementById('weaponBar').style.display = 'none';
     document.getElementById('gameOver').style.display = 'none';
     document.getElementById('pauseMenu').style.display = 'none';
     document.getElementById('druidForms').style.display = 'none';
@@ -1719,6 +3134,10 @@ function startGame() {
         goldCollected = 0;
         currentWave = 1;
         spawnTimer = 0;
+        pendingLevelUps = 0;
+        reaperSpawned = false;
+        reaperWarningTime = 0;
+        vacuumPickups = [];
 
         // Clear existing entities
         enemies.forEach(e => e.destroy());
@@ -1739,6 +3158,7 @@ function startGame() {
         document.getElementById('classSelect').style.display = 'none';
         document.getElementById('mainMenu').style.display = 'none';
         document.getElementById('hud').style.display = 'block';
+        document.getElementById('statsPanel').style.display = 'block';
 
         // Show druid forms if druid
         if (selectedClass === 'druid') {
@@ -1782,6 +3202,108 @@ function updateHUD() {
     const seconds = Math.floor(gameTime % 60);
     document.getElementById('timeText').textContent =
         minutes + ':' + (seconds < 10 ? '0' : '') + seconds;
+
+    // Update stats panel
+    updateStatsPanel();
+
+    // Update weapon bar
+    updateWeaponBar();
+}
+
+function updateStatsPanel() {
+    if (!player) return;
+
+    const dmgEl = document.getElementById('statDamage');
+    const spdEl = document.getElementById('statSpeed');
+    const atkEl = document.getElementById('statAttackSpeed');
+    const armEl = document.getElementById('statArmor');
+    const critEl = document.getElementById('statCrit');
+    const regenEl = document.getElementById('statRegen');
+
+    // Update values
+    dmgEl.textContent = Math.round(player.damageMult * 100) + '%';
+    spdEl.textContent = Math.round(player.speedMult * 100) + '%';
+    atkEl.textContent = Math.round(player.attackSpeedMult * 100) + '%';
+    armEl.textContent = Math.round(player.armor * 100) + '%';
+    critEl.textContent = Math.round(player.critChance * 100) + '%';
+    regenEl.textContent = player.regen.toFixed(1) + '/s';
+
+    // Highlight buffed stats (above base)
+    dmgEl.className = player.damageMult > 1 ? 'stat-value buffed' : 'stat-value';
+    spdEl.className = player.speedMult > 1 ? 'stat-value buffed' : 'stat-value';
+    atkEl.className = player.attackSpeedMult > 1 ? 'stat-value buffed' : 'stat-value';
+    armEl.className = player.armor > 0 ? 'stat-value buffed' : 'stat-value';
+    critEl.className = player.critChance > 0 ? 'stat-value buffed' : 'stat-value';
+    regenEl.className = player.regen > 0 ? 'stat-value buffed' : 'stat-value';
+}
+
+function updateWeaponBar() {
+    if (!player) return;
+
+    const bar = document.getElementById('weaponBar');
+    const weaponIds = ['holyOrbit', 'garlicAura', 'boomerang', 'lightning', 'throwingAxe'];
+
+    // Check if player has any passive weapons
+    const hasWeapons = weaponIds.some(id => player.passiveWeapons[id]);
+
+    if (!hasWeapons) {
+        bar.style.display = 'none';
+        return;
+    }
+
+    bar.style.display = 'flex';
+
+    // Build weapon slots with real-time cooldowns
+    let html = '';
+    for (let weaponId of weaponIds) {
+        if (player.passiveWeapons[weaponId]) {
+            const level = player.passiveWeapons[weaponId];
+            const weapon = WEAPONS[weaponId];
+            const iconInfo = getWeaponIcon(weaponId);
+
+            // Calculate cooldown percentage for weapons with timers
+            let cooldownPercent = 0;
+            let isFiring = false;
+
+            if (weaponId === 'boomerang' && weapon.cooldown) {
+                const maxCooldown = weapon.cooldown / (1 + (level - 1) * 0.1);
+                cooldownPercent = Math.max(0, player.boomerangTimer / maxCooldown * 100);
+                isFiring = player.boomerangTimer <= 0.1;
+            } else if (weaponId === 'lightning' && weapon.cooldown) {
+                const maxCooldown = weapon.cooldown / (1 + (level - 1) * 0.15);
+                cooldownPercent = Math.max(0, player.lightningTimer / maxCooldown * 100);
+                isFiring = player.lightningTimer <= 0.1;
+            } else if (weaponId === 'throwingAxe' && weapon.cooldown) {
+                const maxCooldown = weapon.cooldown / (1 + (level - 1) * 0.12);
+                cooldownPercent = Math.max(0, player.axeTimer / maxCooldown * 100);
+                isFiring = player.axeTimer <= 0.1;
+            }
+
+            const firingClass = isFiring ? ' firing' : '';
+
+            html += `
+                <div class="weapon-slot${firingClass}" id="slot-${weaponId}">
+                    <div style="font-size: 20px; color: ${iconInfo.color};">${iconInfo.icon}</div>
+                    <span class="level-badge">${level}</span>
+                    <span class="weapon-name">${iconInfo.name}</span>
+                    ${cooldownPercent > 0 ? `<div class="cooldown-overlay" style="height: ${cooldownPercent}%;"></div>` : ''}
+                </div>
+            `;
+        }
+    }
+
+    bar.innerHTML = html;
+}
+
+function getWeaponIcon(weaponId) {
+    const icons = {
+        holyOrbit: { icon: '&#10041;', name: 'Orbit', color: '#ffd700' },
+        garlicAura: { icon: '&#9678;', name: 'Aura', color: '#44ff44' },
+        boomerang: { icon: '&#10554;', name: 'Boom', color: '#aa7744' },
+        lightning: { icon: '&#9889;', name: 'Bolt', color: '#4488ff' },
+        throwingAxe: { icon: '&#9876;', name: 'Axe', color: '#888888' }
+    };
+    return icons[weaponId] || { icon: '?', name: '???', color: '#fff' };
 }
 
 function updateFormButtons() {
@@ -1810,6 +3332,16 @@ function showLevelUp() {
     gameState = 'levelup';
     document.getElementById('levelUp').style.display = 'block';
 
+    // Update header to show pending level-ups
+    const header = document.querySelector('#levelUp h2');
+    if (header) {
+        if (pendingLevelUps > 1) {
+            header.textContent = `LEVEL UP! (${pendingLevelUps} remaining)`;
+        } else {
+            header.textContent = 'LEVEL UP!';
+        }
+    }
+
     // Get random upgrades
     const shuffled = [...UPGRADES].sort(() => Math.random() - 0.5);
     const options = shuffled.slice(0, 3);
@@ -1820,7 +3352,14 @@ function showLevelUp() {
     options.forEach(upgrade => {
         const card = document.createElement('div');
         card.className = 'upgrade-card';
-        card.innerHTML = `<h4>${upgrade.name}</h4><p>${upgrade.desc}</p>`;
+
+        // Show current level for weapons player already has
+        let levelText = '';
+        if (upgrade.isWeapon && player.passiveWeapons[upgrade.value]) {
+            levelText = ` <span style="color:#44ff44;">(Lv.${player.passiveWeapons[upgrade.value]})</span>`;
+        }
+
+        card.innerHTML = `<h4>${upgrade.name}${levelText}</h4><p>${upgrade.desc}</p>`;
         card.onclick = () => chooseLevelUpgrade(upgrade);
         container.appendChild(card);
     });
@@ -1828,14 +3367,30 @@ function showLevelUp() {
 
 function chooseLevelUpgrade(upgrade) {
     player.applyUpgrade(upgrade);
-    document.getElementById('levelUp').style.display = 'none';
-    gameState = 'playing';
+
+    // Decrement pending level-ups
+    pendingLevelUps--;
+
+    // Check if there are more pending level-ups
+    if (pendingLevelUps > 0) {
+        // Show next level-up after a brief delay
+        setTimeout(() => {
+            if (gameState === 'levelup') {
+                showLevelUp();
+            }
+        }, 100);
+    } else {
+        document.getElementById('levelUp').style.display = 'none';
+        gameState = 'playing';
+    }
 }
 
 function gameOver() {
     gameState = 'gameover';
 
     document.getElementById('hud').style.display = 'none';
+    document.getElementById('statsPanel').style.display = 'none';
+    document.getElementById('weaponBar').style.display = 'none';
     document.getElementById('druidForms').style.display = 'none';
     document.getElementById('gameOver').style.display = 'block';
 
@@ -1848,6 +3403,11 @@ function gameOver() {
 
     // Clean up
     if (player) {
+        // Clean up orbiting projectiles
+        for (let orb of player.orbitingProjectiles) {
+            orb.destroy();
+        }
+        player.orbitingProjectiles = [];
         player.destroy();
         player = null;
     }
@@ -1867,6 +3427,11 @@ function resumeGame() {
 
 function quitToMenu() {
     if (player) {
+        // Clean up orbiting projectiles
+        for (let orb of player.orbitingProjectiles) {
+            orb.destroy();
+        }
+        player.orbitingProjectiles = [];
         player.destroy();
         player = null;
     }
@@ -1938,6 +3503,9 @@ function gameUpdate() {
         // Spawn enemies
         spawnEnemies();
 
+        // Update vacuum pickups animation
+        updateVacuumPickups();
+
         // Update HUD periodically
         updateHUD();
     }
@@ -1949,6 +3517,62 @@ function gameUpdate() {
         } else if (gameState === 'paused') {
             resumeGame();
         }
+    }
+}
+
+// Update vacuum pickup animations
+function updateVacuumPickups() {
+    if (!player || vacuumPickups.length === 0) return;
+
+    const toRemove = [];
+
+    for (let i = 0; i < vacuumPickups.length; i++) {
+        const vp = vacuumPickups[i];
+
+        // Handle delay
+        if (vp.delay > 0) {
+            vp.delay -= timeDelta;
+            continue;
+        }
+
+        // Update progress
+        vp.progress += timeDelta * 3; // Speed of vacuum
+
+        if (vp.progress >= 1) {
+            // Collect the pickup
+            if (vp.pickup && vp.pickup.collect) {
+                // Remove from vacuum list before collecting
+                toRemove.push(i);
+
+                // Check if pickup still exists
+                const pickupIndex = pickups.indexOf(vp.pickup);
+                if (pickupIndex > -1) {
+                    vp.pickup.collect();
+                }
+            }
+        } else {
+            // Animate toward player with easing
+            const easeProgress = 1 - Math.pow(1 - vp.progress, 3); // Ease out cubic
+            const targetPos = player.pos;
+
+            // Curved path with slight spiral
+            const spiralOffset = vec2(
+                Math.sin(vp.progress * Math.PI * 4) * (1 - vp.progress) * 0.5,
+                Math.cos(vp.progress * Math.PI * 4) * (1 - vp.progress) * 0.5
+            );
+
+            vp.pickup.pos = vp.startPos.lerp(targetPos, easeProgress).add(spiralOffset);
+
+            // Spawn trail particles
+            if (Math.random() < 0.3) {
+                new HitParticle(vp.pickup.pos, new Color(0.4, 0.8, 1));
+            }
+        }
+    }
+
+    // Remove collected pickups from vacuum list (in reverse order)
+    for (let i = toRemove.length - 1; i >= 0; i--) {
+        vacuumPickups.splice(toRemove[i], 1);
     }
 }
 
@@ -1978,7 +3602,209 @@ function gameRender() {
 }
 
 function gameRenderPost() {
-    // Post render (UI overlay if needed)
+    if (gameState !== 'playing' || !player) return;
+
+    // Draw visual barriers at top and bottom
+    drawBarriers();
+
+    // Draw reaper warning if active
+    if (reaperWarningTime > 0) {
+        drawReaperWarning();
+        reaperWarningTime -= timeDelta;
+    }
+
+    // Draw minimap
+    drawMinimap();
+}
+
+// Visual barriers at top and bottom
+function drawBarriers() {
+    const centerY = WORLD_SIZE.y / 2;
+    const verticalLimit = 25;
+    const topY = centerY + verticalLimit;
+    const bottomY = centerY - verticalLimit;
+
+    // Get camera-relative positions
+    const screenTop = cameraPos.y + 12;
+    const screenBottom = cameraPos.y - 12;
+
+    // Draw top barrier if visible
+    if (topY < screenTop + 5) {
+        const barrierY = topY;
+        const pulse = 0.5 + Math.sin(time * 3) * 0.2;
+
+        // Warning zone gradient
+        for (let i = 0; i < 5; i++) {
+            const alpha = (0.15 - i * 0.03) * pulse;
+            const y = barrierY - i * 0.5;
+            drawRect(vec2(cameraPos.x, y), vec2(50, 0.5), new Color(1, 0.2, 0.2, alpha));
+        }
+
+        // Main barrier line
+        drawRect(vec2(cameraPos.x, barrierY), vec2(50, 0.15), new Color(1, 0.3, 0.3, 0.8));
+
+        // Barrier pattern
+        for (let x = -25; x < 25; x += 2) {
+            const xPos = cameraPos.x + x + Math.sin(time * 2 + x) * 0.2;
+            drawRect(vec2(xPos, barrierY), vec2(0.3, 0.4), new Color(1, 0.4, 0.4, 0.6 * pulse));
+        }
+    }
+
+    // Draw bottom barrier if visible
+    if (bottomY > screenBottom - 5) {
+        const barrierY = bottomY;
+        const pulse = 0.5 + Math.sin(time * 3 + Math.PI) * 0.2;
+
+        // Warning zone gradient
+        for (let i = 0; i < 5; i++) {
+            const alpha = (0.15 - i * 0.03) * pulse;
+            const y = barrierY + i * 0.5;
+            drawRect(vec2(cameraPos.x, y), vec2(50, 0.5), new Color(1, 0.2, 0.2, alpha));
+        }
+
+        // Main barrier line
+        drawRect(vec2(cameraPos.x, barrierY), vec2(50, 0.15), new Color(1, 0.3, 0.3, 0.8));
+
+        // Barrier pattern
+        for (let x = -25; x < 25; x += 2) {
+            const xPos = cameraPos.x + x + Math.sin(time * 2 + x) * 0.2;
+            drawRect(vec2(xPos, barrierY), vec2(0.3, 0.4), new Color(1, 0.4, 0.4, 0.6 * pulse));
+        }
+    }
+}
+
+// Reaper warning screen effect
+function drawReaperWarning() {
+    const alpha = Math.min(1, reaperWarningTime) * 0.3;
+    const flash = Math.sin(time * 10) > 0 ? 0.2 : 0;
+
+    // Red screen flash
+    drawRect(cameraPos, vec2(50, 30), new Color(0.5, 0, 0, alpha + flash));
+
+    // Warning text position (center of screen)
+    const textPos = cameraPos.add(vec2(0, 3));
+
+    // Pulsing warning box
+    const boxPulse = 1 + Math.sin(time * 8) * 0.1;
+    drawRect(textPos, vec2(8 * boxPulse, 1.5 * boxPulse), new Color(0.3, 0, 0, 0.9));
+    drawRect(textPos, vec2(7.5 * boxPulse, 1.2 * boxPulse), new Color(0.1, 0, 0, 1));
+
+    // Skull icon representation
+    const skullPos = textPos.add(vec2(-2.5, 0));
+    drawRect(skullPos, vec2(0.6, 0.5), new Color(1, 1, 1, 0.9)); // Skull
+    drawRect(skullPos.add(vec2(-0.15, 0.1)), vec2(0.12, 0.12), new Color(0, 0, 0, 1)); // Eye
+    drawRect(skullPos.add(vec2(0.15, 0.1)), vec2(0.12, 0.12), new Color(0, 0, 0, 1)); // Eye
+}
+
+// Minimap in top-right corner
+function drawMinimap() {
+    // Minimap is drawn in screen space using the overlay canvas
+    // Check if LittleJS overlay context exists
+    if (typeof overlayContext === 'undefined' || !overlayContext) return;
+    if (typeof overlayCanvas === 'undefined' || !overlayCanvas) return;
+
+    const ctx = overlayContext;
+    const mapSize = 120;
+    const mapX = overlayCanvas.width - mapSize - 15;
+    const mapY = 15;
+    const mapScale = 3; // How many game units per pixel
+
+    // Background
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+    ctx.fillRect(mapX, mapY, mapSize, mapSize);
+
+    // Border
+    ctx.strokeStyle = '#ffd700';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(mapX, mapY, mapSize, mapSize);
+
+    // Calculate map center based on player position
+    const centerX = mapX + mapSize / 2;
+    const centerY = mapY + mapSize / 2;
+
+    // Draw boundary indicators
+    const centerGameY = WORLD_SIZE.y / 2;
+    const verticalLimit = 25;
+    const topBoundaryY = centerY - (player.pos.y - (centerGameY + verticalLimit)) / mapScale;
+    const bottomBoundaryY = centerY - (player.pos.y - (centerGameY - verticalLimit)) / mapScale;
+
+    ctx.strokeStyle = 'rgba(255, 100, 100, 0.5)';
+    ctx.lineWidth = 1;
+    if (topBoundaryY > mapY && topBoundaryY < mapY + mapSize) {
+        ctx.beginPath();
+        ctx.moveTo(mapX, topBoundaryY);
+        ctx.lineTo(mapX + mapSize, topBoundaryY);
+        ctx.stroke();
+    }
+    if (bottomBoundaryY > mapY && bottomBoundaryY < mapY + mapSize) {
+        ctx.beginPath();
+        ctx.moveTo(mapX, bottomBoundaryY);
+        ctx.lineTo(mapX + mapSize, bottomBoundaryY);
+        ctx.stroke();
+    }
+
+    // Draw pickups (rare items only)
+    for (let pickup of pickups) {
+        const dx = (pickup.pos.x - player.pos.x) / mapScale;
+        const dy = -(pickup.pos.y - player.pos.y) / mapScale;
+
+        if (Math.abs(dx) < mapSize / 2 && Math.abs(dy) < mapSize / 2) {
+            const px = centerX + dx;
+            const py = centerY + dy;
+
+            // Different colors for different pickups
+            if (pickup instanceof TreasureChest) {
+                ctx.fillStyle = '#ffd700'; // Gold for chests
+                ctx.fillRect(px - 3, py - 3, 6, 6);
+            } else if (pickup instanceof VacuumCrystal) {
+                ctx.fillStyle = '#00ffff'; // Cyan for vacuum
+                ctx.fillRect(px - 3, py - 3, 6, 6);
+            } else if (pickup instanceof HealthPickup) {
+                ctx.fillStyle = '#ff4444'; // Red for health
+                ctx.fillRect(px - 2, py - 2, 4, 4);
+            } else if (pickup instanceof XPOrb) {
+                ctx.fillStyle = 'rgba(100, 255, 100, 0.5)'; // Faint green for XP
+                ctx.fillRect(px - 1, py - 1, 2, 2);
+            }
+        }
+    }
+
+    // Draw enemies
+    for (let enemy of enemies) {
+        const dx = (enemy.pos.x - player.pos.x) / mapScale;
+        const dy = -(enemy.pos.y - player.pos.y) / mapScale;
+
+        if (Math.abs(dx) < mapSize / 2 && Math.abs(dy) < mapSize / 2) {
+            const px = centerX + dx;
+            const py = centerY + dy;
+
+            if (enemy.isBoss) {
+                // Reaper - large red dot
+                ctx.fillStyle = '#ff0000';
+                ctx.beginPath();
+                ctx.arc(px, py, 5, 0, Math.PI * 2);
+                ctx.fill();
+            } else {
+                // Regular enemies - small red dots
+                ctx.fillStyle = 'rgba(255, 80, 80, 0.7)';
+                ctx.fillRect(px - 1, py - 1, 2, 2);
+            }
+        }
+    }
+
+    // Draw player (center, green triangle pointing up)
+    ctx.fillStyle = '#44ff44';
+    ctx.beginPath();
+    ctx.moveTo(centerX, centerY - 4);
+    ctx.lineTo(centerX - 3, centerY + 3);
+    ctx.lineTo(centerX + 3, centerY + 3);
+    ctx.closePath();
+    ctx.fill();
+
+    // Minimap label
+    ctx.fillStyle = '#888';
+    ctx.font = '10px Courier New';
+    ctx.fillText('MAP', mapX + 5, mapY + mapSize - 5);
 }
 
 // Start the engine
